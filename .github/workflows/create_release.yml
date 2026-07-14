@@ -1,0 +1,81 @@
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Download Dalamud
+        shell: pwsh
+        run: |
+          $dalamud = "$env:APPDATA\XIVLauncher\addon\Hooks\dev"
+          New-Item -ItemType Directory -Force -Path $dalamud | Out-Null
+          Invoke-WebRequest -Uri "https://goatcorp.github.io/dalamud-distrib/latest.zip" -OutFile "$env:RUNNER_TEMP\dalamud.zip"
+          Expand-Archive -Force -Path "$env:RUNNER_TEMP\dalamud.zip" -DestinationPath $dalamud
+
+      - name: Build (Release)
+        run: dotnet build HrothgarMakeCoin/HrothgarMakeCoin.csproj -c Release
+
+      - name: Resolve version
+        id: ver
+        shell: pwsh
+        run: |
+          $ref = "${{ github.ref_name }}"
+          $v = $ref -replace '^v', ''
+          if ([string]::IsNullOrWhiteSpace($v) -or $v -eq $ref) {
+            # Not a v* tag (e.g. manual dispatch): fall back to the built manifest version.
+            $manifest = Get-Content "HrothgarMakeCoin/bin/Release/HrothgarMakeCoin/HrothgarMakeCoin.json" -Raw | ConvertFrom-Json
+            $v = $manifest.AssemblyVersion
+          }
+          "version=$v" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Sync repo.json on main
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        run: |
+          git fetch origin main
+          git checkout main
+          $v = "${{ steps.ver.outputs.version }}"
+          $repo = Get-Content repo.json -Raw | ConvertFrom-Json
+          foreach ($p in $repo) {
+            $p.AssemblyVersion = $v
+            $p.TestingAssemblyVersion = $v
+          }
+          ($repo | ConvertTo-Json -Depth 20) | Set-Content repo.json -Encoding utf8
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add repo.json
+          git diff --cached --quiet
+          if ($LASTEXITCODE -ne 0) {
+            git commit -m "chore: bump pluginmaster to $v [skip ci]"
+            git push origin main
+          }
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: HrothgarMakeCoin ${{ steps.ver.outputs.version }}
+          generate_release_notes: true
+          files: HrothgarMakeCoin/bin/Release/HrothgarMakeCoin/latest.zip
