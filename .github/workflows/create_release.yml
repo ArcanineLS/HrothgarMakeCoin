@@ -49,28 +49,6 @@ jobs:
           }
           "version=$v" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
-      - name: Sync repo.json on main
-        if: startsWith(github.ref, 'refs/tags/')
-        shell: pwsh
-        run: |
-          git fetch origin main
-          git checkout main
-          $v = "${{ steps.ver.outputs.version }}"
-          $repo = Get-Content repo.json -Raw | ConvertFrom-Json
-          foreach ($p in $repo) {
-            $p.AssemblyVersion = $v
-            $p.TestingAssemblyVersion = $v
-          }
-          ($repo | ConvertTo-Json -Depth 20) | Set-Content repo.json -Encoding utf8
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add repo.json
-          git diff --cached --quiet
-          if ($LASTEXITCODE -ne 0) {
-            git commit -m "chore: bump pluginmaster to $v [skip ci]"
-            git push origin main
-          }
-
       - name: Publish GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2

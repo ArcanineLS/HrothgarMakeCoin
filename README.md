@@ -31,7 +31,7 @@ A FFXIV [Dalamud](https://github.com/goatcorp/Dalamud) plugin that automatically
 2. Under **Custom Plugin Repositories**, add:
 
    ```text
-   https://raw.githubusercontent.com/ArcanineLS/HrothgarMakeCoin/main/repo.json
+   https://raw.githubusercontent.com/ArcanineLS/DalamudPluginRepo/master/pluginmaster.json
    ```
 
 3. Click **+**, then **Save**.
