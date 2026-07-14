@@ -117,6 +117,12 @@ namespace HrothgarMakeCoin
       }
     }
 
+    // Screen-space offsets (before UI scale) for the RetainerList "Auto Pinch" button. It sits in
+    // the bottom-left footer area, clear of the header's gil total and the window's close button.
+    // Tweak these two values if your UI layout needs it nudged.
+    private const float RetainerListButtonOffsetX = 15f;
+    private const float RetainerListButtonOffsetBottom = 6f;
+
     private void DrawForRetainerList()
     {
       unsafe
@@ -126,12 +132,18 @@ namespace HrothgarMakeCoin
           if (Plugin.Configuration.EnablePinchKey && Plugin.KeyState[Plugin.Configuration.PinchKey])
             PinchAllRetainers();
 
-          var node = addon->UldManager.NodeList[27];
-
-          if (node == null)
+          var root = addon->RootNode;
+          if (root == null)
             return;
 
-          var oldSize = ImGuiSetup(node);
+          // Anchor to the addon's bottom-left footer instead of a header node, so the button no
+          // longer overlaps the retainer gil total and the window controls.
+          var rootPos = GetNodePosition(root);
+          var rootScale = GetNodeScale(root);
+          var rootSize = new Vector2(root->Width, root->Height) * rootScale;
+          var position = rootPos + new Vector2(RetainerListButtonOffsetX * rootScale.X, rootSize.Y - RetainerListButtonOffsetBottom * rootScale.Y);
+
+          var oldSize = ImGuiSetup(position, rootScale, new Vector2(1f, 1f), "###AutoPinchRetainerList");
           DrawAutoPinchButton(PinchAllRetainers);
           ImGuiPostSetup(oldSize);
         }
@@ -164,7 +176,11 @@ namespace HrothgarMakeCoin
       var position = GetNodePosition(node);
       var scale = GetNodeScale(node);
       var size = new Vector2(node->Width, node->Height) * scale;
+      return ImGuiSetup(position, scale, size, $"###AutoPinch{node->NodeId}");
+    }
 
+    private float ImGuiSetup(Vector2 position, Vector2 scale, Vector2 minSize, string windowId)
+    {
       ImGuiHelpers.ForceNextWindowMainViewport();
       ImGuiHelpers.SetNextWindowPosRelativeMainViewport(position);
 
@@ -172,12 +188,12 @@ namespace HrothgarMakeCoin
       var oldSize = ImGui.GetFont().Scale;
       ImGui.GetFont().Scale *= scale.X;
       ImGui.PushFont(ImGui.GetFont());
-      ImGui.PushStyleVar(ImGuiStyleVar.FrameRounding, 0f.Scale());
-      ImGui.PushStyleVar(ImGuiStyleVar.FramePadding, new Vector2(3f.Scale(), 3f.Scale()));
+      ImGui.PushStyleVar(ImGuiStyleVar.FrameRounding, 4f.Scale());
+      ImGui.PushStyleVar(ImGuiStyleVar.FramePadding, new Vector2(8f.Scale(), 4f.Scale()));
       ImGui.PushStyleVar(ImGuiStyleVar.WindowPadding, new Vector2(0f.Scale(), 0f.Scale()));
       ImGui.PushStyleVar(ImGuiStyleVar.WindowBorderSize, 0f.Scale());
-      ImGui.PushStyleVar(ImGuiStyleVar.WindowMinSize, size);
-      ImGui.Begin($"###AutoPinch{node->NodeId}", ImGuiWindowFlags.AlwaysAutoResize | ImGuiWindowFlags.NoScrollbar | ImGuiWindowFlags.NoNavFocus
+      ImGui.PushStyleVar(ImGuiStyleVar.WindowMinSize, minSize);
+      ImGui.Begin(windowId, ImGuiWindowFlags.AlwaysAutoResize | ImGuiWindowFlags.NoScrollbar | ImGuiWindowFlags.NoNavFocus
           | ImGuiWindowFlags.AlwaysUseWindowPadding | ImGuiWindowFlags.NoTitleBar | ImGuiWindowFlags.NoSavedSettings);
 
       return oldSize;
@@ -194,7 +210,23 @@ namespace HrothgarMakeCoin
 
     private void DrawAutoPinchButton(Action specificPinchFunction)
     {
-      if (_taskManager.IsBusy)
+      var busy = _taskManager.IsBusy;
+
+      // Accent-themed button (purple for Auto Pinch, red for Cancel) so it reads cleanly over the
+      // game UI rather than as a plain grey box.
+      var baseColor = busy
+        ? new System.Numerics.Vector4(0.62f, 0.22f, 0.22f, 0.92f)
+        : new System.Numerics.Vector4(0.42f, 0.34f, 0.62f, 0.92f);
+      var hoverColor = busy
+        ? new System.Numerics.Vector4(0.74f, 0.28f, 0.28f, 1f)
+        : new System.Numerics.Vector4(0.52f, 0.42f, 0.74f, 1f);
+
+      ImGui.PushStyleColor(ImGuiCol.Button, baseColor);
+      ImGui.PushStyleColor(ImGuiCol.ButtonHovered, hoverColor);
+      ImGui.PushStyleColor(ImGuiCol.ButtonActive, hoverColor);
+      ImGui.PushStyleColor(ImGuiCol.Text, new System.Numerics.Vector4(1f, 1f, 1f, 1f));
+
+      if (busy)
       {
         if (ImGui.Button("Cancel"))
         {
@@ -203,24 +235,17 @@ namespace HrothgarMakeCoin
           RemoveTalkAddonListeners();
         }
         if (ImGui.IsItemHovered())
-        {
-          ImGui.BeginTooltip();
           ImGui.SetTooltip("Cancels the auto pinching process");
-          ImGui.EndTooltip();
-        }
       }
       else
       {
         if (ImGui.Button("Auto Pinch"))
           specificPinchFunction();
         if (ImGui.IsItemHovered())
-        {
-          ImGui.BeginTooltip();
-          ImGui.SetTooltip("Starts auto pinching\r\n" +
-                           "Please do not interact with the game while this process is running");
-          ImGui.EndTooltip();
-        }
+          ImGui.SetTooltip("Starts auto pinching\r\nPlease do not interact with the game while this process is running");
       }
+
+      ImGui.PopStyleColor(4);
     }
 
     private unsafe void PinchAllRetainers()
