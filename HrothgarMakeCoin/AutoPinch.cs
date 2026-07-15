@@ -10,6 +10,7 @@ using ECommons.DalamudServices;
 using ECommons.ImGuiMethods;
 using ECommons.UIHelpers.AddonMasterImplementations;
 using ECommons.UIHelpers.AtkReaderImplementations;
+using FFXIVClientStructs.FFXIV.Client.Game;
 using FFXIVClientStructs.FFXIV.Client.UI;
 using FFXIVClientStructs.FFXIV.Common.Math;
 using FFXIVClientStructs.FFXIV.Component.GUI;
@@ -166,9 +167,44 @@ namespace HrothgarMakeCoin
 
           var oldSize = ImGuiSetup(node);
           DrawAutoPinchButton(PinchAllRetainerItems);
+          DrawAutoListButton();
           ImGuiPostSetup(oldSize);
         }
       }
+    }
+
+    /// <summary>
+    /// "Auto List" button beside "Auto Pinch" on the retainer sell list. Only shown when auto-list is
+    /// enabled; amber when it will post for real, green-ish while in dry run.
+    /// </summary>
+    private void DrawAutoListButton()
+    {
+      if (!Plugin.Configuration.AutoListEnabled || _taskManager.IsBusy)
+        return;
+
+      ImGui.SameLine();
+
+      var dry = Plugin.Configuration.AutoListDryRun;
+      var baseColor = dry
+        ? new System.Numerics.Vector4(0.28f, 0.46f, 0.34f, 0.92f)
+        : new System.Numerics.Vector4(0.64f, 0.42f, 0.16f, 0.92f);
+      var hoverColor = dry
+        ? new System.Numerics.Vector4(0.36f, 0.58f, 0.44f, 1f)
+        : new System.Numerics.Vector4(0.78f, 0.54f, 0.22f, 1f);
+
+      ImGui.PushStyleColor(ImGuiCol.Button, baseColor);
+      ImGui.PushStyleColor(ImGuiCol.ButtonHovered, hoverColor);
+      ImGui.PushStyleColor(ImGuiCol.ButtonActive, hoverColor);
+      ImGui.PushStyleColor(ImGuiCol.Text, new System.Numerics.Vector4(1f, 1f, 1f, 1f));
+
+      if (ImGui.Button(dry ? "Auto List (dry)" : "Auto List"))
+        StartAutoList();
+      if (ImGui.IsItemHovered())
+        ImGui.SetTooltip(dry
+          ? "Dry run: reports what it WOULD post to chat. Nothing is listed."
+          : "Posts whitelisted items into this retainer's free market slots.\r\nPosts are immediate and IRREVERSIBLE.");
+
+      ImGui.PopStyleColor(4);
     }
 
     private unsafe float ImGuiSetup(AtkResNode* node)
@@ -176,7 +212,29 @@ namespace HrothgarMakeCoin
       var position = GetNodePosition(node);
       var scale = GetNodeScale(node);
       var size = new Vector2(node->Width, node->Height) * scale;
+
+      // Content grows rightwards from this anchor, so a second button runs off the addon's right edge.
+      // Shift left by exactly what Auto List will occupy: the group's right edge then lands where the
+      // lone Auto Pinch button's right edge used to sit, keeping the tuned position.
+      position.X -= GetAutoListReservedWidth(scale);
+
       return ImGuiSetup(position, scale, size, $"###AutoPinch{node->NodeId}");
+    }
+
+    /// <summary>
+    /// Horizontal space the "Auto List" button needs, including its <c>SameLine</c> gap — measured the
+    /// way <see cref="ImGuiSetup(Vector2, Vector2, Vector2, string)"/> will actually draw it: text at the
+    /// node's scale, plus the FramePadding pushed there. 0 when the button is hidden.
+    /// Deliberately ignores the busy state, which only hides Auto List, so the group doesn't jump
+    /// sideways for the duration of every run.
+    /// </summary>
+    private static float GetAutoListReservedWidth(Vector2 scale)
+    {
+      if (!Plugin.Configuration.AutoListEnabled)
+        return 0f;
+
+      var label = Plugin.Configuration.AutoListDryRun ? "Auto List (dry)" : "Auto List";
+      return (ImGui.CalcTextSize(label).X * scale.X) + (8f.Scale() * 2f) + ImGui.GetStyle().ItemSpacing.X;
     }
 
     private float ImGuiSetup(Vector2 position, Vector2 scale, Vector2 minSize, string windowId)
@@ -434,6 +492,288 @@ namespace HrothgarMakeCoin
       {
         Svc.Log.Error(ex, "Error releasing AutoRetainer after post-venture pinch");
       }
+    }
+
+    // ---------- Auto-list: post whitelisted items into free market slots ----------
+
+    private int _autoListQuantity;
+
+    /// <summary>
+    /// Market basis resolved for each (item, HQ) during the CURRENT auto-list run, so every Spread batch
+    /// of an item posts at the same price. Re-querying per batch would read a board that already contains
+    /// the batch we just posted; with UndercutSelf on, each batch would then undercut the previous one and
+    /// walk the price down to MinPrice. Keyed by (itemId, hq) rather than by name, unlike _cachedPrices.
+    /// </summary>
+    private readonly Dictionary<(uint ItemId, bool Hq), int> _autoListRunPrices = [];
+
+    /// <summary>Guards against spamming the "market is full" notice once per remaining batch.</summary>
+    private bool _autoListFullWarned;
+
+    /// <summary>
+    /// Posts whitelisted items into the active retainer's free market slots. Honours the dry-run
+    /// switch (reports what it WOULD post, without confirming). Guardrails per the auto-list design:
+    /// whitelist-only, mandatory price floor, no-guess pricing, mandatory dedupe, slot re-resolve,
+    /// read-back before confirm, and the 20-slot cap.
+    /// </summary>
+    public void StartAutoList()
+    {
+      if (_taskManager.IsBusy)
+      {
+        Svc.Chat.PrintError("[HrothgarMakeCoin] Busy - wait for the current operation to finish.");
+        return;
+      }
+
+      if (!Plugin.Configuration.AutoListEnabled)
+      {
+        Svc.Chat.PrintError("[HrothgarMakeCoin] Auto-list is off. Enable it in /hmc -> Min/Max Prices -> Auto-List Whitelist.");
+        return;
+      }
+
+      var free = AutoListDriver.GetFreeMarketSlots();
+      if (free < 0)
+      {
+        Svc.Chat.PrintError("[HrothgarMakeCoin] No active retainer - open a retainer's market session first.");
+        return;
+      }
+      if (free == 0)
+      {
+        Svc.Chat.Print("[HrothgarMakeCoin] Retainer market is full (20/20); nothing to post.");
+        return;
+      }
+
+      ClearState();
+      _mbHandler.PopulateRetainerCache();
+
+      var planned = 0;
+      foreach (var entry in Plugin.Configuration.AutoListItems)
+      {
+        if (planned >= free)
+          break;
+
+        if (!entry.Enabled)
+          continue;
+
+        var name = ItemNameResolver.GetItemName(entry.ItemId);
+
+        if (!entry.IsValid)
+        {
+          Svc.Log.Information($"[AutoList] skip {name}: needs a Min price (and Max >= Min)");
+          continue;
+        }
+
+        // Dedupe is mandatory for normal entries, but Spread deliberately makes several listings of
+        // the same item, so it opts out (it self-terminates when the stack runs dry instead).
+        var spreading = entry.Spread && entry.Quantity > 0;
+        if (!spreading && AutoListDriver.IsAlreadyListed(entry.ItemId, entry.ListHq))
+        {
+          Svc.Log.Information($"[AutoList] skip {name}: already listed");
+          continue;
+        }
+
+        if (!AutoListDriver.TryFindStack(entry.ItemId, entry.ListHq, out _, out _, out var stack))
+        {
+          Svc.Log.Information($"[AutoList] skip {name}: no matching stack in inventory");
+          continue;
+        }
+
+        // Spread: one listing per batch of Quantity until the stack is gone or slots run out.
+        var batches = spreading ? (int)Math.Ceiling(stack / (double)entry.Quantity) : 1;
+        batches = Math.Min(batches, free - planned);
+        if (spreading)
+          Svc.Log.Information($"[AutoList] {name}: spreading stack of {stack} into {batches} listing(s) of {entry.Quantity}");
+
+        for (var b = 0; b < batches; b++)
+        {
+          EnqueueAutoListItem(entry, b);
+          planned++;
+        }
+      }
+
+      if (planned == 0)
+      {
+        Svc.Chat.Print("[HrothgarMakeCoin] Auto-list: nothing eligible to post.");
+        return;
+      }
+
+      var dry = Plugin.Configuration.AutoListDryRun ? "DRY RUN - " : string.Empty;
+      Svc.Chat.Print($"[HrothgarMakeCoin] Auto-list: {dry}processing {planned} listing(s) into {free} free slot(s). Please don't interact with the game.");
+    }
+
+    private void EnqueueAutoListItem(AutoListItem entry, int batch)
+    {
+      var id = $"{entry.ItemId}#{batch}";
+      _taskManager.Enqueue(() => AutoListOpen(entry), $"AL_Open{id}");
+      _taskManager.DelayNext(Plugin.Configuration.AutoListStepDelayMS);
+      _taskManager.Enqueue(() => AutoListComparePrice(entry), $"AL_Compare{id}");
+      _taskManager.DelayNext(Plugin.Configuration.AutoListPriceWaitMS);
+      _taskManager.Enqueue(() => AutoListSetPriceAndConfirm(entry), $"AL_Confirm{id}");
+      _taskManager.DelayNext(Plugin.Configuration.AutoListStepDelayMS);
+    }
+
+    /// <summary>
+    /// Price discovery for one auto-list batch. Reuses the basis this run already resolved for the item
+    /// instead of asking the market board again — see <see cref="_autoListRunPrices"/> for why that matters.
+    /// </summary>
+    private bool? AutoListComparePrice(AutoListItem entry)
+    {
+      if (_skipCurrentItem)
+        return true;
+
+      if (_autoListRunPrices.TryGetValue((entry.ItemId, entry.ListHq), out var basis))
+      {
+        _newPrice = basis;
+        return true;
+      }
+
+      return ClickComparePrice();
+    }
+
+    private bool? AutoListOpen(AutoListItem entry)
+    {
+      _newPrice = null;
+      _skipCurrentItem = false;
+
+      var name = ItemNameResolver.GetItemName(entry.ItemId);
+
+      // Re-check capacity per batch. The whole run is planned up-front against one slot count, and that
+      // number is only a prediction: our own earlier batches, another plugin, or a manual post can all
+      // consume slots in between. Without this the run keeps posting until the GAME refuses.
+      if (AutoListDriver.GetFreeMarketSlots() == 0)
+      {
+        Svc.Log.Information($"[AutoList] {name}: retainer market is full - skipping.");
+        if (!_autoListFullWarned)
+        {
+          _autoListFullWarned = true;
+          Svc.Chat.Print("[HrothgarMakeCoin] Auto-list: retainer market is full (20/20); skipping the rest.");
+        }
+        _skipCurrentItem = true;
+        return true;
+      }
+
+      // Locate the stack fresh, right before posting. This is what makes it safe to post at all (the
+      // slot is matched on ItemId+HQ this instant, so there is no stale-slot window in which we could
+      // post the wrong item), and it is what lets Spread follow a stack as each batch shrinks it.
+      if (!AutoListDriver.TryFindStack(entry.ItemId, entry.ListHq, out var container, out var slot, out var stack))
+      {
+        // Expected for Spread: the last batch runs out. Skip this one, don't kill the whole run.
+        Svc.Log.Information($"[AutoList] {name}: no stack left - skipping.");
+        _skipCurrentItem = true;
+        return true;
+      }
+
+      // 0 = whole stack. Always clamp to what's actually there: the game clamps the quantity input to
+      // the stack size, so an unclamped request would fail the read-back verify and abort the run.
+      var want = entry.Quantity <= 0 ? stack : Math.Min(entry.Quantity, stack);
+      _autoListQuantity = Math.Max(1, want);
+      if (entry.Quantity > 0 && entry.Quantity > stack)
+        Svc.Log.Information($"[AutoList] {name}: only {stack} in stack, listing {_autoListQuantity} (asked for {entry.Quantity})");
+
+      if (!AutoListDriver.TryOpenPutUpForSale(container, slot))
+      {
+        Svc.Log.Warning($"[AutoList] {name}: could not open 'Put up for sale' - skipping.");
+        _skipCurrentItem = true;
+        return true;
+      }
+
+      return true;
+    }
+
+    private unsafe bool? AutoListSetPriceAndConfirm(AutoListItem entry)
+    {
+      if (_skipCurrentItem)
+      {
+        _skipCurrentItem = false;
+        return true;
+      }
+
+      if (!GenericHelpers.TryGetAddonByName<AddonRetainerSell>("RetainerSell", out var addon) || !GenericHelpers.IsAddonReady(&addon->AtkUnitBase))
+        return false; // dialog not up yet - retry
+
+      // Close the compare-prices results window so it doesn't linger between items.
+      if (GenericHelpers.TryGetAddonByName<AtkUnitBase>("ItemSearchResult", out var searchResult))
+        searchResult->Close(true);
+
+      var name = ItemNameResolver.GetItemName(entry.ItemId);
+
+      // ---- price ----
+      int price;
+      if (entry.PriceMode == AutoListPriceMode.FixedMinPrice)
+      {
+        price = entry.MinPrice;
+      }
+      else
+      {
+        // MarketBoardHandler has already applied the undercut. NOTE: it only spares our own listings when
+        // UndercutSelf is OFF — with it on, our own listing is undercut like anyone else's. That's why the
+        // basis is resolved once per run and reused (_autoListRunPrices) rather than re-read per batch.
+        var market = _newPrice ?? -1;
+        if (market <= 0)
+        {
+          Svc.Log.Warning($"[AutoList] {name}: no market price found - skipping (never guessing).");
+          Svc.Chat.PrintError($"[HrothgarMakeCoin] Auto-list skipped {name}: no market price found.");
+          CancelRetainerSell(addon);
+          return true;
+        }
+
+        // First batch of this item resolved the basis: pin it for the rest of the run.
+        _autoListRunPrices.TryAdd((entry.ItemId, entry.ListHq), market);
+
+        // A ceiling BELOW the market must never clamp the price down: that would post the item at a
+        // massive discount (e.g. market 110 capped to Max 5). Skip instead of dumping.
+        if (entry.MaxPrice > 0 && market > entry.MaxPrice)
+        {
+          Svc.Log.Warning($"[AutoList] {name}: market {market:N0} is above Max {entry.MaxPrice:N0} - skipping (posting at Max would dump it far under value).");
+          Svc.Chat.PrintError($"[HrothgarMakeCoin] Auto-list skipped {name}: market {market:N0} gil is above your Max of {entry.MaxPrice:N0} gil.");
+          CancelRetainerSell(addon);
+          return true;
+        }
+
+        price = Math.Max(market, entry.MinPrice); // floor applied LAST - always wins
+      }
+
+      if (price <= 0)
+      {
+        Svc.Log.Warning($"[AutoList] {name}: computed price <= 0 - skipping.");
+        CancelRetainerSell(addon);
+        return true;
+      }
+
+      var qty = Math.Max(1, _autoListQuantity);
+
+      if (Plugin.Configuration.AutoListDryRun)
+      {
+        Svc.Log.Information($"[AutoList][DRY RUN] would post {name} x{qty} @ {price:N0} gil ({entry.PriceMode})");
+        Svc.Chat.Print($"[HrothgarMakeCoin] [DRY RUN] would post {name} x{qty} @ {price:N0} gil");
+        CancelRetainerSell(addon);
+        return true;
+      }
+
+      addon->Quantity->SetValue(qty);
+      addon->AskingPrice->SetValue(price);
+
+      // MANDATORY read-back: the dialog pre-fills defaults and a set can silently no-op, which would
+      // otherwise confirm the GAME's price/quantity instead of ours.
+      var actualQty = addon->Quantity->Value;
+      var actualPrice = addon->AskingPrice->Value;
+      if (actualQty != qty || actualPrice != price)
+      {
+        Svc.Log.Error($"[AutoList] {name}: read-back mismatch (qty {actualQty} vs {qty}, price {actualPrice} vs {price}) - aborting run.");
+        Svc.Chat.PrintError($"[HrothgarMakeCoin] Auto-list aborted on {name}: price/quantity did not stick.");
+        CancelRetainerSell(addon);
+        _taskManager.Abort();
+        return true;
+      }
+
+      ECommons.Automation.Callback.Fire(&addon->AtkUnitBase, true, 0); // confirm
+      Svc.Log.Information($"[AutoList] posted {name} x{qty} @ {price:N0} gil");
+      Svc.Chat.Print($"[HrothgarMakeCoin] Posted {name} x{qty} @ {price:N0} gil");
+      return true;
+    }
+
+    private static unsafe void CancelRetainerSell(AddonRetainerSell* addon)
+    {
+      ECommons.Automation.Callback.Fire(&addon->AtkUnitBase, true, 1); // cancel
+      addon->AtkUnitBase.Close(true);
     }
 
     private unsafe bool? EnqueueAllRetainerItems(Action<int> enqueueFunc, bool reverseOrder)
@@ -824,6 +1164,8 @@ namespace HrothgarMakeCoin
       _cachedPrices = [];
       _cachedPricesUseUniversalisDataCenterPrices = Plugin.Configuration.UseUniversalisDataCenterPrices;
       _skipCurrentItem = false;
+      _autoListRunPrices.Clear();
+      _autoListFullWarned = false;
       CancelUniversalisPriceRequest();
     }
 

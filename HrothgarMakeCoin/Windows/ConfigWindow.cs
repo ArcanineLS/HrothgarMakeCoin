@@ -7,6 +7,7 @@ using Dalamud.Bindings.ImGui;
 using ECommons.UIHelpers.AddonMasterImplementations;
 using static ECommons.GenericHelpers;
 using FFXIVClientStructs.FFXIV.Component.GUI;
+using Lumina.Excel.Sheets;
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -19,6 +20,7 @@ public sealed class ConfigWindow : Window
   private static readonly string[] _virtualKeyStrings = Enum.GetNames<VirtualKey>();
 
   private int _selectedTab;
+  private string _autoListAddInput = string.Empty;
 
   private const string RepoUrl = "https://github.com/SHOEGAZEssb/Dagobert";
 
@@ -65,6 +67,7 @@ public sealed class ConfigWindow : Window
         break;
       case 2:
         DrawItemPriceLimits();
+        DrawAutoListWhitelist();
         break;
       default:
         DrawGeneralConfig();
@@ -705,6 +708,254 @@ public sealed class ConfigWindow : Window
     if (limitToRemove != null)
     {
       Plugin.Configuration.ItemPriceLimits.Remove(limitToRemove);
+      Plugin.Configuration.Save();
+    }
+  }
+
+  private void DrawAutoListWhitelist()
+  {
+    ImGui.Dummy(new Vector2(0, 10));
+    UiTheme.SectionHeader("Auto-List Whitelist", FontAwesomeIcon.Store);
+
+    UiTheme.TextWrappedColored(UiTheme.Muted,
+      "Opt-in list of items HrothgarMakeCoin may post to a retainer's market board. Only whitelisted " +
+      "items are ever posted, and each needs a Min price to be valid. (Listing execution is a work in progress.)");
+    ImGui.Dummy(new Vector2(0, 4));
+
+    ConfigCheckbox("Enable auto-list",
+      () => Plugin.Configuration.AutoListEnabled,
+      v => Plugin.Configuration.AutoListEnabled = v,
+      "Master switch for the auto-list feature. Run it with /hmcautolist while a retainer's market session is open.");
+
+    ImGui.SameLine(0, 30);
+
+    ConfigCheckbox("Dry run",
+      () => Plugin.Configuration.AutoListDryRun,
+      v => Plugin.Configuration.AutoListDryRun = v,
+      "STRONGLY recommended until you trust the prices. Reports what it WOULD post and cancels instead " +
+      "of confirming, so nothing is actually listed. Turn off to post for real (irreversible).");
+
+    if (Plugin.Configuration.AutoListEnabled && !Plugin.Configuration.AutoListDryRun)
+    {
+      UiTheme.Icon(FontAwesomeIcon.ExclamationTriangle, UiTheme.Bad);
+      ImGui.SameLine();
+      UiTheme.TextWrappedColored(UiTheme.Bad, "Dry run is OFF — /hmcautolist will post real items. Posts are immediate and irreversible.");
+    }
+
+    ImGui.Dummy(new Vector2(0, 4));
+
+    // Timing.
+    var stepDelay = Plugin.Configuration.AutoListStepDelayMS;
+    ImGui.AlignTextToFramePadding();
+    ImGui.Text("Step delay (ms):");
+    ImGui.SameLine();
+    ImGui.SetNextItemWidth(180f);
+    if (ImGui.SliderInt("##autoListStepDelay", ref stepDelay, 50, 3000))
+    {
+      Plugin.Configuration.AutoListStepDelayMS = stepDelay;
+      Plugin.Configuration.Save();
+    }
+    UiTheme.Tooltip("Pause between auto-list steps (open -> compare prices -> confirm). Raise it if the dialog lags.");
+
+    var priceWait = Plugin.Configuration.AutoListPriceWaitMS;
+    ImGui.AlignTextToFramePadding();
+    ImGui.Text("Price check wait (ms):");
+    ImGui.SameLine();
+    ImGui.SetNextItemWidth(180f);
+    if (ImGui.SliderInt("##autoListPriceWait", ref priceWait, 200, 10000))
+    {
+      Plugin.Configuration.AutoListPriceWaitMS = priceWait;
+      Plugin.Configuration.Save();
+    }
+    UiTheme.Tooltip("How long to wait for market prices after Compare Prices. Too low and the price won't arrive " +
+                    "and the item is skipped (never guessed).");
+
+    ImGui.Dummy(new Vector2(0, 4));
+
+    // Add by item name or ID.
+    ImGui.AlignTextToFramePadding();
+    ImGui.Text("Add item (name or ID):");
+    ImGui.SameLine();
+    ImGui.SetNextItemWidth(240f);
+    var submit = ImGui.InputText("##autoListAdd", ref _autoListAddInput, 128, ImGuiInputTextFlags.EnterReturnsTrue);
+    ImGui.SameLine();
+    if (ImGui.Button("Add##autoListAddBtn") || submit)
+      TryAddAutoListByText(_autoListAddInput);
+
+    ImGui.Dummy(new Vector2(0, 4));
+
+    if (Plugin.Configuration.AutoListItems.Count == 0)
+    {
+      UiTheme.TextWrappedColored(UiTheme.Muted,
+        "Right-click an inventory item -> 'Add to HrothgarMakeCoin auto-list', or add one by name/ID above.");
+      return;
+    }
+
+    DrawAutoListTable();
+  }
+
+  private void TryAddAutoListByText(string query)
+  {
+    query = (query ?? string.Empty).Trim();
+    if (query.Length == 0)
+      return;
+
+    var sheet = Plugin.DataManager.GetExcelSheet<Item>();
+    uint itemId = 0;
+
+    if (uint.TryParse(query, out var id))
+    {
+      if (sheet.TryGetRow(id, out var byId) && !byId.IsUntradable)
+        itemId = id;
+    }
+    else
+    {
+      var exact = sheet.FirstOrDefault(i => !i.IsUntradable && i.Name.GetText().Equals(query, StringComparison.OrdinalIgnoreCase));
+      if (exact.RowId != 0)
+        itemId = exact.RowId;
+      else
+      {
+        var partial = sheet.FirstOrDefault(i => !i.IsUntradable && i.Name.GetText().Length > 0
+          && i.Name.GetText().Contains(query, StringComparison.OrdinalIgnoreCase));
+        if (partial.RowId != 0)
+          itemId = partial.RowId;
+      }
+    }
+
+    if (itemId == 0)
+    {
+      Plugin.ChatGui.PrintError($"[HrothgarMakeCoin] No tradable item found for '{query}'.");
+      return;
+    }
+
+    var added = Plugin.Configuration.GetAutoListItem(itemId) == null;
+    Plugin.Configuration.GetOrAddAutoListItem(itemId);
+    Plugin.Configuration.Save();
+    _autoListAddInput = string.Empty;
+
+    if (!added)
+      Plugin.ChatGui.Print($"[HrothgarMakeCoin] {ItemNameResolver.GetItemName(itemId)} is already in the auto-list.");
+  }
+
+  private static void DrawAutoListTable()
+  {
+    AutoListItem? toRemove = null;
+    var tableFlags = ImGuiTableFlags.Borders | ImGuiTableFlags.RowBg | ImGuiTableFlags.NoSavedSettings | ImGuiTableFlags.SizingStretchProp;
+    if (!ImGui.BeginTable("##autoListTable", 8, tableFlags))
+      return;
+
+    ImGui.TableSetupColumn("Item", ImGuiTableColumnFlags.WidthStretch);
+    ImGui.TableSetupColumn("HQ", ImGuiTableColumnFlags.WidthFixed, 34f);
+    ImGui.TableSetupColumn("Price", ImGuiTableColumnFlags.WidthFixed, 120f);
+    ImGui.TableSetupColumn("Min", ImGuiTableColumnFlags.WidthFixed, 90f);
+    ImGui.TableSetupColumn("Max", ImGuiTableColumnFlags.WidthFixed, 90f);
+    ImGui.TableSetupColumn("Qty", ImGuiTableColumnFlags.WidthFixed, 90f);
+    ImGui.TableSetupColumn("Spread", ImGuiTableColumnFlags.WidthFixed, 52f);
+    ImGui.TableSetupColumn("", ImGuiTableColumnFlags.WidthFixed, 70f);
+    ImGui.TableHeadersRow();
+
+    var priceModes = new[] { "Undercut", "Fixed min" };
+
+    foreach (var entry in Plugin.Configuration.AutoListItems
+      .OrderBy(e => ItemNameResolver.GetItemName(e.ItemId))
+      .ThenBy(e => e.ItemId)
+      .ToList())
+    {
+      ImGui.TableNextRow();
+      ImGui.PushID((int)entry.ItemId);
+
+      // Item name + enabled toggle + validity warning.
+      ImGui.TableNextColumn();
+      var enabled = entry.Enabled;
+      if (ImGui.Checkbox("##en", ref enabled)) { entry.Enabled = enabled; Plugin.Configuration.Save(); }
+      ImGui.SameLine();
+      ImGui.AlignTextToFramePadding();
+      ImGui.TextUnformatted(ItemNameResolver.GetItemName(entry.ItemId));
+      if (!entry.IsValid)
+      {
+        ImGui.SameLine();
+        UiTheme.Icon(FontAwesomeIcon.ExclamationTriangle, UiTheme.Warn);
+        UiTheme.Tooltip("Needs a Min price (and Max >= Min) before it can be posted.");
+      }
+
+      // HQ
+      ImGui.TableNextColumn();
+      var hq = entry.ListHq;
+      if (ImGui.Checkbox("##hq", ref hq)) { entry.ListHq = hq; Plugin.Configuration.Save(); }
+
+      // Price mode
+      ImGui.TableNextColumn();
+      var modeIdx = (int)entry.PriceMode;
+      ImGui.SetNextItemWidth(-1);
+      if (ImGui.Combo("##mode", ref modeIdx, priceModes, priceModes.Length))
+      {
+        entry.PriceMode = (AutoListPriceMode)modeIdx;
+        Plugin.Configuration.Save();
+      }
+
+      // Min
+      ImGui.TableNextColumn();
+      var min = entry.MinPrice;
+      ImGui.SetNextItemWidth(-1);
+      if (ImGui.InputInt("##min", ref min))
+      {
+        entry.MinPrice = Math.Clamp(min, 0, int.MaxValue);
+        if (entry.MaxPrice > 0 && entry.MaxPrice < entry.MinPrice) entry.MaxPrice = entry.MinPrice;
+        Plugin.Configuration.Save();
+      }
+
+      // Max
+      ImGui.TableNextColumn();
+      var max = entry.MaxPrice;
+      ImGui.SetNextItemWidth(-1);
+      if (ImGui.InputInt("##max", ref max))
+      {
+        entry.MaxPrice = Math.Clamp(max, 0, int.MaxValue);
+        if (entry.MaxPrice > 0 && entry.MinPrice > entry.MaxPrice) entry.MinPrice = entry.MaxPrice;
+        Plugin.Configuration.Save();
+      }
+      UiTheme.Tooltip("0 = no limit. If the market price is ABOVE this, the item is SKIPPED (never posted at " +
+                      "the ceiling) — otherwise a low Max would dump the item far under market value.");
+
+      // Quantity (0 = whole stack)
+      ImGui.TableNextColumn();
+      var qty = entry.Quantity;
+      ImGui.SetNextItemWidth(-1);
+      if (ImGui.InputInt("##qty", ref qty))
+      {
+        entry.Quantity = Math.Clamp(qty, 0, int.MaxValue);
+        Plugin.Configuration.Save();
+      }
+      UiTheme.Tooltip("How many to list. 0 = the whole stack. Otherwise this many, clamped to what's actually in the stack.\n" +
+                      "With Spread on, this is the size of each listing.");
+
+      // Spread (repeat listings of Qty until the stack is empty)
+      ImGui.TableNextColumn();
+      var spread = entry.Spread;
+      if (ImGui.Checkbox("##spread", ref spread)) { entry.Spread = spread; Plugin.Configuration.Save(); }
+      UiTheme.Tooltip("Split the stack across several listings of Qty each, until the stack runs out or the\n" +
+                      "retainer runs out of free slots. Example: a 99 stack with Qty 5 posts 5 at a time.\n\n" +
+                      "Needs a Qty above 0. Spread items are posted more than once on purpose, so the\n" +
+                      "\"already listed\" check doesn't apply to them.");
+      if (entry.Spread && entry.Quantity <= 0)
+      {
+        ImGui.SameLine(0f, 2f);
+        UiTheme.Icon(FontAwesomeIcon.ExclamationTriangle, UiTheme.Warn);
+        UiTheme.Tooltip("Spread needs a Qty above 0 to know how big each listing should be. Ignored for now.");
+      }
+
+      // Remove
+      ImGui.TableNextColumn();
+      if (ImGui.SmallButton("Remove")) toRemove = entry;
+
+      ImGui.PopID();
+    }
+
+    ImGui.EndTable();
+
+    if (toRemove != null)
+    {
+      Plugin.Configuration.AutoListItems.Remove(toRemove);
       Plugin.Configuration.Save();
     }
   }

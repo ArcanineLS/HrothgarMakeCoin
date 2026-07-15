@@ -24,6 +24,7 @@ public sealed class Plugin : IDalamudPlugin
   private const string CommandMain = "/hrothgarmakecoin";
   private const string CommandShort = "/hmc";
   private const string CommandLegacy = "/dagobert";
+  private const string CommandAutoList = "/hmcautolist";
 
   [PluginService] internal static IDalamudPluginInterface PluginInterface { get; private set; } = null!;
   [PluginService] internal static ICommandManager CommandManager { get; private set; } = null!;
@@ -67,6 +68,11 @@ public sealed class Plugin : IDalamudPlugin
       HelpMessage = "Legacy alias for /hrothgarmakecoin",
       ShowInHelp = false
     });
+    CommandManager.AddHandler(CommandAutoList, new CommandInfo(OnAutoListCommand)
+    {
+      HelpMessage = "Auto-list whitelisted items into the active retainer's free market slots",
+      ShowInHelp = false
+    });
 
     // Register chat link handler for clickable config link
     ConfigLinkPayload = ChatGui.AddChatLinkHandler(0, (id, _) => ToggleConfigUI());
@@ -96,6 +102,7 @@ public sealed class Plugin : IDalamudPlugin
     CommandManager.RemoveHandler(CommandMain);
     CommandManager.RemoveHandler(CommandShort);
     CommandManager.RemoveHandler(CommandLegacy);
+    CommandManager.RemoveHandler(CommandAutoList);
     WindowSystem.RemoveAllWindows();
     _autoPinch.Dispose();
     UiTheme.HeaderFont?.Dispose();
@@ -148,6 +155,11 @@ public sealed class Plugin : IDalamudPlugin
     ToggleConfigUI();
   }
 
+  // Proof-of-concept: safe dry-run that opens "Put up for sale" for a retainer item and stops
+  // (no price, no confirm). Runs on the framework thread (command dispatch).
+  // Posts whitelisted items into the active retainer's free market slots (honours the dry-run switch).
+  private void OnAutoListCommand(string command, string args) => _autoPinch.StartAutoList();
+
   private void OnContextMenuOpened(IMenuOpenedArgs args)
   {
     if (!Configuration.ShowInventoryContextMenuEntry)
@@ -156,20 +168,33 @@ public sealed class Plugin : IDalamudPlugin
     if (args.MenuType != ContextMenuType.Inventory)
       return;
 
-    var itemId = (args.Target as MenuTargetInventory)?.TargetItem?.BaseItemId ?? 0u;
+    var targetItem = (args.Target as MenuTargetInventory)?.TargetItem;
+    var itemId = targetItem?.BaseItemId ?? 0u;
     if (itemId == 0)
       return;
 
     if (!DataManager.GetExcelSheet<Item>().TryGetRow(itemId, out var item))
       return;
 
+    var tradable = !item.IsUntradable;
+    var isHq = targetItem?.IsHq ?? false;
+
     var isConfigured = Configuration.ItemPriceLimits.Any(limit => limit.ItemId == itemId);
     args.AddMenuItem(new MenuItem
     {
       Name = isConfigured ? "Configure HrothgarMakeCoin price limits" : "Add HrothgarMakeCoin price limits",
       PrefixChar = 'H',
-      IsEnabled = !item.IsUntradable,
+      IsEnabled = tradable,
       OnClicked = GetPriceLimitMenuItemClickedHandler(itemId),
+    });
+
+    var inAutoList = Configuration.AutoListItems.Any(x => x.ItemId == itemId);
+    args.AddMenuItem(new MenuItem
+    {
+      Name = inAutoList ? "Configure HrothgarMakeCoin auto-list" : "Add to HrothgarMakeCoin auto-list",
+      PrefixChar = 'H',
+      IsEnabled = tradable,
+      OnClicked = GetAutoListMenuItemClickedHandler(itemId, isHq),
     });
   }
 
@@ -193,6 +218,30 @@ public sealed class Plugin : IDalamudPlugin
       catch (Exception ex)
       {
         Svc.Log.Error(ex, $"Failed to add item {itemId} to HrothgarMakeCoin price limits");
+      }
+    };
+  }
+
+  private Action<IMenuItemClickedArgs> GetAutoListMenuItemClickedHandler(uint itemId, bool isHq)
+  {
+    return _ =>
+    {
+      try
+      {
+        var added = Configuration.GetAutoListItem(itemId) == null;
+        Configuration.GetOrAddAutoListItem(itemId, isHq);
+        Configuration.Save();
+        ConfigWindow.IsOpen = true;
+
+        var message = added ? ": Added to HrothgarMakeCoin auto-list." : ": Already in HrothgarMakeCoin auto-list.";
+        ChatGui.Print(new SeStringBuilder()
+          .AddItemLink(itemId, isHq)
+          .AddText(message)
+          .Build());
+      }
+      catch (Exception ex)
+      {
+        Svc.Log.Error(ex, $"Failed to add item {itemId} to HrothgarMakeCoin auto-list");
       }
     };
   }

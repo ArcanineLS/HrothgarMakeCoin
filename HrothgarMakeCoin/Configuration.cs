@@ -42,6 +42,49 @@ public sealed class ItemPriceLimit
   }
 }
 
+public enum AutoListPriceMode
+{
+  MarketUndercut,
+  FixedMinPrice
+}
+
+/// <summary>
+/// A whitelist entry for the (opt-in) auto-list feature: an item HrothgarMakeCoin may post to a
+/// retainer's market board. See HrothgarMakeCoin-AutoList-Design.md for the full behaviour.
+/// </summary>
+[Serializable]
+public sealed class AutoListItem
+{
+  public uint ItemId { get; set; }
+
+  public bool Enabled { get; set; } = true;
+
+  /// <summary>Post HQ stacks (else NQ). Defaulted from the item the user added.</summary>
+  public bool ListHq { get; set; }
+
+  public AutoListPriceMode PriceMode { get; set; } = AutoListPriceMode.MarketUndercut;
+
+  /// <summary>How many to list. 0 = the whole stack; otherwise this many, clamped to the stack size.</summary>
+  public int Quantity { get; set; } = 0;
+
+  /// <summary>
+  /// Spread a stack across multiple listings: keep posting batches of <see cref="Quantity"/> until the
+  /// stack is empty or the retainer runs out of free slots (e.g. a 99 stack with Quantity 5 -> 5x20).
+  /// Requires <see cref="Quantity"/> &gt; 0. Spread entries intentionally create multiple listings, so
+  /// the "already listed" dedupe does not apply to them.
+  /// </summary>
+  public bool Spread { get; set; } = false;
+
+  /// <summary>Fixed price (FixedMinPrice) or mandatory floor (MarketUndercut). Required (&gt; 0) to post.</summary>
+  public int MinPrice { get; set; } = 0;
+
+  /// <summary>Optional ceiling (0 = none). Must be 0 or &gt;= MinPrice.</summary>
+  public int MaxPrice { get; set; } = 0;
+
+  /// <summary>Safe to post: enabled, has a floor, and a consistent price window.</summary>
+  public bool IsValid => Enabled && MinPrice > 0 && (MaxPrice == 0 || MaxPrice >= MinPrice);
+}
+
 [Serializable]
 public sealed class Configuration : IPluginConfiguration
 {
@@ -109,6 +152,24 @@ public sealed class Configuration : IPluginConfiguration
 
   public List<ItemPriceLimit> ItemPriceLimits { get; set; } = [];
 
+  /// <summary>Master switch for the opt-in auto-list feature.</summary>
+  public bool AutoListEnabled { get; set; } = false;
+
+  /// <summary>
+  /// When on (the default), auto-list computes and reports what it WOULD post but cancels instead of
+  /// confirming — nothing is actually listed. Turn off only once you trust the prices it picks.
+  /// </summary>
+  public bool AutoListDryRun { get; set; } = true;
+
+  /// <summary>Delay between auto-list steps (open -> compare -> confirm), in milliseconds.</summary>
+  public int AutoListStepDelayMS { get; set; } = 300;
+
+  /// <summary>How long to wait for the market price after clicking Compare Prices, in milliseconds.</summary>
+  public int AutoListPriceWaitMS { get; set; } = 1000;
+
+  /// <summary>The auto-list whitelist (items that may be posted to the market board).</summary>
+  public List<AutoListItem> AutoListItems { get; set; } = [];
+
   /// <summary>
   /// Set of retainer names that are enabled for auto pinch.
   /// If empty or null, all retainers are enabled by default.
@@ -138,6 +199,22 @@ public sealed class Configuration : IPluginConfiguration
     limit = new ItemPriceLimit { ItemId = itemId };
     ItemPriceLimits.Add(limit);
     return limit;
+  }
+
+  public AutoListItem? GetAutoListItem(uint itemId)
+  {
+    return AutoListItems.FirstOrDefault(x => x.ItemId == itemId);
+  }
+
+  public AutoListItem GetOrAddAutoListItem(uint itemId, bool hq = false)
+  {
+    var entry = GetAutoListItem(itemId);
+    if (entry != null)
+      return entry;
+
+    entry = new AutoListItem { ItemId = itemId, ListHq = hq };
+    AutoListItems.Add(entry);
+    return entry;
   }
 
   public void Save()
