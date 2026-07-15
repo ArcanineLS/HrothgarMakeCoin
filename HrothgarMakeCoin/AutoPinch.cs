@@ -32,6 +32,21 @@ namespace HrothgarMakeCoin
     private readonly UniversalisPriceProvider _universalisPriceProvider;
     private int? _oldPrice;
     private int? _newPrice;
+
+    /// <summary>
+    /// The (item, quality) <see cref="_newPrice"/> was actually produced for, or null if it came from an
+    /// uncorrelated request (the pinch flow). Auto-list refuses to post a price it can't attribute.
+    /// </summary>
+    private (uint ItemId, bool Hq)? _newPriceKey;
+
+    /// <summary>
+    /// The (item, quality) the in-flight auto-list price request is about. Price sources that carry their
+    /// own identity check — the Universalis request id, and the per-item cache read — stamp
+    /// <see cref="_newPriceKey"/> from this; the market board path uses the handler's own correlation
+    /// instead, which is stronger. Null outside an auto-list batch.
+    /// </summary>
+    private (uint ItemId, bool Hq)? _autoListPriceKey;
+
     private bool _newPriceFromUniversalis;
     private bool _skipCurrentItem = false;
     private readonly TaskManager _taskManager;
@@ -553,7 +568,7 @@ namespace HrothgarMakeCoin
         if (!entry.Enabled)
           continue;
 
-        var name = ItemNameResolver.GetItemName(entry.ItemId);
+        var name = AutoListLabel(entry);
 
         if (!entry.IsValid)
         {
@@ -599,9 +614,15 @@ namespace HrothgarMakeCoin
       Svc.Chat.Print($"[HrothgarMakeCoin] Auto-list: {dry}processing {planned} listing(s) into {free} free slot(s). Please don't interact with the game.");
     }
 
+    /// <summary>Item name tagged with the quality this entry targets — NQ and HQ are separate entries.</summary>
+    private static string AutoListLabel(AutoListItem entry) =>
+      $"{ItemNameResolver.GetItemName(entry.ItemId)} ({(entry.ListHq ? "HQ" : "NQ")})";
+
     private void EnqueueAutoListItem(AutoListItem entry, int batch)
     {
-      var id = $"{entry.ItemId}#{batch}";
+      // Quality belongs in the id: an item's NQ and HQ batches are distinct work, and sharing a task
+      // name between them makes the run log ambiguous about which one acted.
+      var id = $"{entry.ItemId}{(entry.ListHq ? "hq" : "nq")}#{batch}";
       _taskManager.Enqueue(() => AutoListOpen(entry), $"AL_Open{id}");
       _taskManager.DelayNext(Plugin.Configuration.AutoListStepDelayMS);
       _taskManager.Enqueue(() => AutoListComparePrice(entry), $"AL_Compare{id}");
@@ -619,21 +640,35 @@ namespace HrothgarMakeCoin
       if (_skipCurrentItem)
         return true;
 
-      if (_autoListRunPrices.TryGetValue((entry.ItemId, entry.ListHq), out var basis))
+      var key = (entry.ItemId, entry.ListHq);
+      _autoListPriceKey = key;
+
+      if (_autoListRunPrices.TryGetValue(key, out var basis))
       {
         _newPrice = basis;
+        _newPriceKey = key;
         return true;
       }
 
+      // The market board request declares itself from _autoListPriceKey at the point it is actually
+      // issued (see ClickComparePrice) rather than here — arming it up front would leave an expectation
+      // behind on the paths that return without ever opening a search.
       return ClickComparePrice();
     }
 
     private bool? AutoListOpen(AutoListItem entry)
     {
       _newPrice = null;
+      _newPriceKey = null;
+      _autoListPriceKey = null;
       _skipCurrentItem = false;
 
-      var name = ItemNameResolver.GetItemName(entry.ItemId);
+      // Invalidate any Universalis request still in flight from the previous batch. Starting a request
+      // cancels the previous one, but a batch that reuses the run's cached basis never starts one — so
+      // without this the previous batch's answer could land mid-batch and be stamped as this item's price.
+      CancelUniversalisPriceRequest();
+
+      var name = AutoListLabel(entry);
 
       // Re-check capacity per batch. The whole run is planned up-front against one slot count, and that
       // number is only a prediction: our own earlier batches, another plugin, or a manual post can all
@@ -693,7 +728,7 @@ namespace HrothgarMakeCoin
       if (GenericHelpers.TryGetAddonByName<AtkUnitBase>("ItemSearchResult", out var searchResult))
         searchResult->Close(true);
 
-      var name = ItemNameResolver.GetItemName(entry.ItemId);
+      var name = AutoListLabel(entry);
 
       // ---- price ----
       int price;
@@ -715,8 +750,21 @@ namespace HrothgarMakeCoin
           return true;
         }
 
+        // Prove the price belongs to THIS entry before posting against it. The confirm step runs on a
+        // fixed delay rather than on the arrival of its own answer, so "a price is present" is not the
+        // same as "our price is present". An unattributable price is skipped, never guessed at.
+        var key = (entry.ItemId, entry.ListHq);
+        if (_newPriceKey != key)
+        {
+          Svc.Log.Warning(
+            $"[AutoList] {name}: price {market:N0} was requested for {_newPriceKey?.ToString() ?? "an uncorrelated request"} - skipping.");
+          Svc.Chat.PrintError($"[HrothgarMakeCoin] Auto-list skipped {name}: could not confirm the price belongs to this item.");
+          CancelRetainerSell(addon);
+          return true;
+        }
+
         // First batch of this item resolved the basis: pin it for the rest of the run.
-        _autoListRunPrices.TryAdd((entry.ItemId, entry.ListHq), market);
+        _autoListRunPrices.TryAdd(key, market);
 
         // A ceiling BELOW the market must never clamp the price down: that would post the item at a
         // massive discount (e.g. market 110 capped to Max 5). Skip instead of dumping.
@@ -918,6 +966,8 @@ namespace HrothgarMakeCoin
         {
           Svc.Log.Debug($"{itemName}: using cached price");
           _newPrice = cachedPrice.Value;
+          // Read synchronously for the item whose dialog is open, so it belongs to the current batch.
+          _newPriceKey = _autoListPriceKey;
           _newPriceFromUniversalis = cachedPrice.FromUniversalis;
           return true;
         }
@@ -929,6 +979,18 @@ namespace HrothgarMakeCoin
             StartUniversalisPriceRequest(itemName, rawItemName);
             return true;
           }
+
+          // Declare what this request is for at the only place a request is actually issued. Arming it
+          // earlier would strand an expectation whenever a branch above returns without opening a search,
+          // and the next request to open one — a pinch, possibly for a different item — would consume it
+          // and have its own answer rejected as foreign.
+          //
+          // The pinch flow declares nothing (_autoListPriceKey is null) and clears explicitly, so it can
+          // never inherit auto-list's correlation and keeps its uncorrelated behaviour.
+          if (_autoListPriceKey is { } declared)
+            _mbHandler.ExpectPriceRequest(declared.ItemId, declared.Hq);
+          else
+            _mbHandler.ClearExpectedPriceRequest();
 
           Svc.Log.Debug($"Clicking compare prices");
           ECommons.Automation.Callback.Fire(&addon->AtkUnitBase, true, 4);
@@ -1014,6 +1076,8 @@ namespace HrothgarMakeCoin
     {
       Svc.Log.Debug($"New price received: {e.NewPrice}");
       _newPrice = e.NewPrice;
+      // Record what this price was actually asked about; null for the pinch flow, which doesn't declare.
+      _newPriceKey = _mbHandler.InFlightKey;
       _newPriceFromUniversalis = false;
     }
 
@@ -1043,16 +1107,25 @@ namespace HrothgarMakeCoin
       var requestId = ++_universalisPriceRequestId;
       _newPriceFromUniversalis = false;
       _universalisPriceRequestCts = new CancellationTokenSource();
-      _ = CompleteUniversalisPriceRequest(itemName, rawItemName, requestId, _universalisPriceRequestCts.Token);
+
+      // Capture the declaration now, with the batch that is asking. Reading it when the response lands
+      // would attribute the price to whatever batch happened to be current by then.
+      var declared = _autoListPriceKey;
+      _ = CompleteUniversalisPriceRequest(itemName, rawItemName, declared, requestId, _universalisPriceRequestCts.Token);
     }
 
-    private async Task CompleteUniversalisPriceRequest(string itemName, string rawItemName, int requestId, CancellationToken cancellationToken)
+    private async Task CompleteUniversalisPriceRequest(string itemName, string rawItemName,
+      (uint ItemId, bool Hq)? declared, int requestId, CancellationToken cancellationToken)
     {
       var price = -1;
 
       try
       {
-        price = await _universalisPriceProvider.GetNewPrice(itemName, rawItemName, cancellationToken).ConfigureAwait(false);
+        // Pass the declared (item, quality) so the price is fetched for exactly what this batch is
+        // posting, rather than for a name re-resolved from the dialog and a quality decided by the
+        // pinch-oriented "Use HQ price" preference; null leaves the pinch flow's behaviour alone.
+        price = await _universalisPriceProvider
+          .GetNewPrice(itemName, rawItemName, declared, cancellationToken).ConfigureAwait(false);
       }
       catch (OperationCanceledException)
       {
@@ -1070,6 +1143,9 @@ namespace HrothgarMakeCoin
 
         Svc.Log.Debug($"New Universalis price received: {price}");
         _newPrice = price;
+        // Attribute the price to the batch that actually requested it — captured at request time, and
+        // quality-matched by GetNewPrice above, so this is evidence rather than an assumption.
+        _newPriceKey = declared;
         _newPriceFromUniversalis = price > 0;
       });
     }
@@ -1101,6 +1177,15 @@ namespace HrothgarMakeCoin
 
       if (Plugin.Configuration.EnablePostPinchkey && Plugin.KeyState[Plugin.Configuration.PostPinchKey])
       {
+        // The only pinch entry point that doesn't go through ClearState, so it has to drop the previous
+        // flow's pricing state itself. The correlation key left over from the last auto-list batch would
+        // otherwise make this pinch price a different item — or the same item at the other quality — and
+        // the stale _newPrice would be read as this item's price if the compare doesn't answer in time.
+        _autoListPriceKey = null;
+        _newPriceKey = null;
+        _newPrice = null;
+        _newPriceFromUniversalis = false;
+
         _taskManager.Enqueue(ClickComparePrice, $"ClickComparePricePosted");
         _taskManager.DelayNext(Plugin.Configuration.MarketBoardKeepOpenMS);
         _taskManager.Enqueue(SetNewPrice, $"SetNewPricePosted");
@@ -1160,6 +1245,9 @@ namespace HrothgarMakeCoin
     private void ClearState()
     {
       _newPrice = null;
+      _newPriceKey = null;
+      _autoListPriceKey = null;
+      _mbHandler.ClearExpectedPriceRequest();
       _newPriceFromUniversalis = false;
       _cachedPrices = [];
       _cachedPricesUseUniversalisDataCenterPrices = Plugin.Configuration.UseUniversalisDataCenterPrices;

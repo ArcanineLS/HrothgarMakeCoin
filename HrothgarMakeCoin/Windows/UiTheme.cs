@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Numerics;
 using Dalamud.Bindings.ImGui;
 using Dalamud.Interface;
@@ -191,4 +192,118 @@ internal static class UiTheme
     ImGui.PopStyleColor();
   }
 
+  /// <summary>
+  /// Scratch text-entry state for <see cref="SliderIntManual"/>, keyed by ImGui widget ID. An entry
+  /// exists only while that slider is in type-a-value mode. The value is held here (not written back to
+  /// the config) until it is committed, so a half-typed number never reaches the caller.
+  /// </summary>
+  private sealed class SliderManualEdit
+  {
+    /// <summary>Live text-box contents. Held unclamped until commit — see the note in the draw code.</summary>
+    public int Buffer;
+
+    /// <summary>SetKeyboardFocusHere has been issued; don't re-issue it every frame.</summary>
+    public bool Focused;
+
+    /// <summary>The box has been observed active at least once, so deactivation now means something.</summary>
+    public bool WasActive;
+  }
+
+  private static readonly Dictionary<uint, SliderManualEdit> _sliderManualEdit = [];
+
+  /// <summary>
+  /// The slider's value as of the frame the user grabbed it, before the click moved it. Kept so that a
+  /// double-click can put back what the first of its two clicks knocked over.
+  /// </summary>
+  private static readonly Dictionary<uint, int> _sliderPreDrag = [];
+
+  /// <summary>
+  /// A slider that can also be typed into: double-click it to swap to a text box, Enter or click-away
+  /// to commit, Escape to cancel. (ImGui's built-in Ctrl+Click still works too.) Returns true whenever
+  /// <paramref name="value"/> changed and should be persisted, so callers use it exactly like a slider.
+  ///
+  /// Set the item width with <c>ImGui.SetNextItemWidth</c> before calling, exactly like a bare slider.
+  /// </summary>
+  public static bool SliderIntManual(string label, ref int value, int min, int max, string? format = null)
+  {
+    var id = ImGui.GetID(label);
+
+    if (_sliderManualEdit.TryGetValue(id, out var edit))
+    {
+      // Take focus once, so the double-click flows straight into typing.
+      if (!edit.Focused)
+      {
+        ImGui.SetKeyboardFocusHere();
+        edit.Focused = true;
+      }
+
+      // Own ID ("##manual"), NOT the slider's. Reusing the slider's ID hands the box the slider's
+      // just-clicked ActiveId history, and ImGui clearing that stale state reads here as an immediate
+      // deactivation — which would close the box on its first frame and make this a dead feature.
+      //
+      // Step buttons off (0, 0) — they'd eat the width and this is a type-a-number box.
+      // Deliberately NOT clamped per keystroke: that would rewrite the number as it's typed (with min
+      // 200, typing "1500" would snap to 200 the moment "1" landed). Clamp once, on commit.
+      var buffer = edit.Buffer;
+      ImGui.InputInt(label + "##manual", ref buffer, 0, 0, "%d", ImGuiInputTextFlags.AutoSelectAll);
+      edit.Buffer = buffer;
+
+      if (ImGui.IsItemActive())
+        edit.WasActive = true;
+
+      // Until the box has actually been active, a deactivation signal is left over from the slider and
+      // must not be believed. This also covers the frames between submitting the focus request and ImGui
+      // granting it.
+      if (!edit.WasActive)
+        return false;
+
+      if (ImGui.IsItemDeactivatedAfterEdit())
+      {
+        // Committed: Enter, Tab, or clicking away after editing. Escape can also land here, but ImGui has
+        // already restored the pre-edit text by then, so it settles as a no-op on the equality check.
+        _sliderManualEdit.Remove(id);
+        var committed = Math.Clamp(buffer, min, max);
+        if (committed == value)
+          return false;
+
+        value = committed;
+        return true;
+      }
+
+      // Cancelled (Escape, or focus lost without an edit), or abandoned because the tab/window changed
+      // out from under an open box — without this it would still be a text box on the way back.
+      if (ImGui.IsItemDeactivated() || !ImGui.IsItemActive())
+        _sliderManualEdit.Remove(id);
+
+      return false;
+    }
+
+    var before = value;
+    var changed = ImGui.SliderInt(label, ref value, min, max, format ?? "%d", ImGuiSliderFlags.AlwaysClamp);
+
+    // A double-click reaches us as two separate clicks, and ImGui's slider jumps the value to the cursor
+    // on the FIRST one — which the caller has already saved by the time the second click tells us this
+    // was a double-click. So restore the value from before that first click and return true, which makes
+    // the caller persist the restore: double-clicking to type leaves the setting where it started.
+    if ((ImGui.IsItemActive() || ImGui.IsItemHovered()) && ImGui.IsMouseDoubleClicked(ImGuiMouseButton.Left))
+    {
+      var seed = _sliderPreDrag.TryGetValue(id, out var pre) ? pre : before;
+      _sliderPreDrag.Remove(id);
+
+      _sliderManualEdit[id] = new SliderManualEdit { Buffer = seed };
+      if (seed == value)
+        return false;
+
+      value = seed;
+      return true;
+    }
+
+    // Grabbing the slider is the last moment its pre-click value still exists; `before` is this frame's
+    // value as read by the caller, i.e. from before ImGui moved it. (Left in place afterwards rather than
+    // cleared: the next grab overwrites it, and it is only ever read on a double-click's second click.)
+    if (ImGui.IsItemActivated())
+      _sliderPreDrag[id] = before;
+
+    return changed;
+  }
 }

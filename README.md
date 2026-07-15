@@ -61,7 +61,7 @@ Auto-pinch re-prices items already on sale. **Auto-list** puts *new* ones up: it
 **Getting started**
 
 1. Enable it under **Min/Max Prices → Auto-List Whitelist**.
-2. Add items: right-click an item in your inventory → **Add to HrothgarMakeCoin auto-list**, or type a name/ID into the box in that section.
+2. Add items: right-click an item in your inventory → **Add to HrothgarMakeCoin auto-list (NQ/HQ)** — it adds the quality you right-clicked — or type a name/ID into the box in that section, ticking **HQ** for the HQ entry.
 3. Give each item a **Min** price — an item without one is never posted.
 4. Open a retainer's **sell list** and click **Auto List**, or run `/hmcautolist`.
 5. Read what the dry run reports in chat. Happy? Turn **Dry run** off and click it again.
@@ -72,10 +72,10 @@ Items can come from your own inventory or the retainer's. Anything already on th
 
 | Setting | Description |
 | --- | --- |
-| **HQ** | Post HQ stacks instead of NQ. Prices are looked up for the matching quality. |
+| **HQ** | Post HQ stacks instead of NQ. An item's NQ and HQ are **separate entries** with their own prices, so you can whitelist both and each is priced against its own quality's market — an HQ stack is never priced off the NQ listings, or the other way round. |
 | **Price** | **Undercut** — post just under the market, but never below **Min**. **Fixed min** — always post at exactly **Min**. |
 | **Min** | **Required.** A hard floor: the price never lands below this, whatever the market says. |
-| **Max** | Optional ceiling. If the market is *above* it, the item is **skipped** — it is never posted *at* the ceiling (that would sell it far under value). `0` = no ceiling. |
+| **Max** | Optional ceiling. If the market is *above* it, the item is **skipped** — it is never posted *at* the ceiling (that would sell it far under value). `0` = no ceiling. A Max below your Min is left exactly as you typed it and the entry simply refuses to post (flagged with a warning); one bound never silently moves the other. |
 | **Qty** | How many to list. `0` = the whole stack; otherwise that many, capped at what you actually have. |
 | **Spread** | Split a stack across several listings of **Qty** each until it runs out or slots do — e.g. a 99 stack at Qty 5 posts 5 at a time. Needs a Qty above 0. |
 
@@ -86,7 +86,7 @@ Items can come from your own inventory or the retainer's. Anything already on th
 | Enable auto-list | Off | Master switch. |
 | Dry run | **On** | Reports what it would post and cancels instead of confirming. Nothing is listed. |
 | Step delay | 300 ms | Pause between steps (open → compare prices → confirm). Raise it if the dialog lags. |
-| Price check wait | 1000 ms | How long to wait for market prices. Too low and the item is skipped rather than guessed. |
+| Price check wait | 2000 ms | How long to wait for market prices. Too low and the item is skipped rather than guessed. HQ needs the most time, since listings arrive cheapest-first and HQ sits above the NQ ones. Double-click the slider to type an exact value. |
 
 ### What it won't do
 

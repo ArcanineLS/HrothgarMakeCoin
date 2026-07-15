@@ -1,6 +1,6 @@
 {
-  "Author": "ArcanineLS",
-  "Name": "HrothgarMakeCoin",
+  "Author": "Bancho",
+  "Name": "Hrothgar Make Coin",
   "Punchline": "Hrothgar make coin. Coin good.",
   "Description": "Automatically undercuts your retainer market board listings, with optional AutoRetainer post-venture integration. A rebrand/fork of Dagobert by SHOEGAZEssb.",
   "ApplicableVersion": "any",
@@ -12,7 +12,7 @@
   ],
   "RepoUrl": "https://github.com/ArcanineLS/HrothgarMakeCoin",
   "InternalName": "HrothgarMakeCoin",
-  "IconUrl": "",
+  "IconUrl": "https://github.com/ArcanineLS/DalamudPluginRepo/raw/master/images/icon.png",
   "ImageUrls": [
     ""
   ],

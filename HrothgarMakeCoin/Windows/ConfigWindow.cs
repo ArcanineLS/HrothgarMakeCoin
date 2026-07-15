@@ -21,6 +21,7 @@ public sealed class ConfigWindow : Window
 
   private int _selectedTab;
   private string _autoListAddInput = string.Empty;
+  private bool _autoListAddHq;
 
   private const string RepoUrl = "https://github.com/SHOEGAZEssb/Dagobert";
 
@@ -676,13 +677,15 @@ public sealed class ConfigWindow : Window
           ImGui.SetTooltip($"Item ID: {limit.ItemId}");
 
         ImGui.TableNextColumn();
+        // As in the auto-list table: a bound must not rewrite the other bound. InputInt reports a change
+        // on every keystroke, so a handler that pulled Min down to meet a half-typed Max would latch the
+        // floor at the first digit of "80000" (i.e. 8) and never restore it. ItemPriceLimit.Apply already
+        // resolves a Max-below-Min window by letting the floor win, so leaving it as typed is safe.
         var minPrice = limit.MinPrice;
         ImGui.SetNextItemWidth(-1);
         if (ImGui.InputInt($"##itemPriceLimitMin{limit.ItemId}", ref minPrice))
         {
-          limit.MinPrice = Math.Clamp(minPrice, 0, int.MaxValue);
-          if (limit.MaxPrice > 0 && limit.MaxPrice < limit.MinPrice)
-            limit.MaxPrice = limit.MinPrice;
+          limit.MinPrice = Math.Max(minPrice, 0);
           Plugin.Configuration.Save();
         }
 
@@ -691,9 +694,7 @@ public sealed class ConfigWindow : Window
         ImGui.SetNextItemWidth(-1);
         if (ImGui.InputInt($"##itemPriceLimitMax{limit.ItemId}", ref maxPrice))
         {
-          limit.MaxPrice = Math.Clamp(maxPrice, 0, int.MaxValue);
-          if (limit.MaxPrice > 0 && limit.MinPrice > limit.MaxPrice)
-            limit.MinPrice = limit.MaxPrice;
+          limit.MaxPrice = Math.Max(maxPrice, 0);
           Plugin.Configuration.Save();
         }
 
@@ -751,25 +752,27 @@ public sealed class ConfigWindow : Window
     ImGui.Text("Step delay (ms):");
     ImGui.SameLine();
     ImGui.SetNextItemWidth(180f);
-    if (ImGui.SliderInt("##autoListStepDelay", ref stepDelay, 50, 3000))
+    if (UiTheme.SliderIntManual("##autoListStepDelay", ref stepDelay, 50, 3000))
     {
       Plugin.Configuration.AutoListStepDelayMS = stepDelay;
       Plugin.Configuration.Save();
     }
-    UiTheme.Tooltip("Pause between auto-list steps (open -> compare prices -> confirm). Raise it if the dialog lags.");
+    UiTheme.Tooltip("Pause between auto-list steps (open -> compare prices -> confirm). Raise it if the dialog lags.\n\n" +
+                    "Double-click to type an exact value.");
 
     var priceWait = Plugin.Configuration.AutoListPriceWaitMS;
     ImGui.AlignTextToFramePadding();
     ImGui.Text("Price check wait (ms):");
     ImGui.SameLine();
     ImGui.SetNextItemWidth(180f);
-    if (ImGui.SliderInt("##autoListPriceWait", ref priceWait, 200, 10000))
+    if (UiTheme.SliderIntManual("##autoListPriceWait", ref priceWait, 200, 10000))
     {
       Plugin.Configuration.AutoListPriceWaitMS = priceWait;
       Plugin.Configuration.Save();
     }
     UiTheme.Tooltip("How long to wait for market prices after Compare Prices. Too low and the price won't arrive " +
-                    "and the item is skipped (never guessed).");
+                    "and the item is skipped (never guessed).\n\n" +
+                    "Double-click to type an exact value.");
 
     ImGui.Dummy(new Vector2(0, 4));
 
@@ -780,8 +783,12 @@ public sealed class ConfigWindow : Window
     ImGui.SetNextItemWidth(240f);
     var submit = ImGui.InputText("##autoListAdd", ref _autoListAddInput, 128, ImGuiInputTextFlags.EnterReturnsTrue);
     ImGui.SameLine();
+    ImGui.Checkbox("HQ##autoListAddHq", ref _autoListAddHq);
+    UiTheme.Tooltip("Add the HQ entry for this item. NQ and HQ are separate entries with their own prices, " +
+                    "so you can have both.");
+    ImGui.SameLine();
     if (ImGui.Button("Add##autoListAddBtn") || submit)
-      TryAddAutoListByText(_autoListAddInput);
+      TryAddAutoListByText(_autoListAddInput, _autoListAddHq);
 
     ImGui.Dummy(new Vector2(0, 4));
 
@@ -795,7 +802,7 @@ public sealed class ConfigWindow : Window
     DrawAutoListTable();
   }
 
-  private void TryAddAutoListByText(string query)
+  private void TryAddAutoListByText(string query, bool hq)
   {
     query = (query ?? string.Empty).Trim();
     if (query.Length == 0)
@@ -829,13 +836,39 @@ public sealed class ConfigWindow : Window
       return;
     }
 
-    var added = Plugin.Configuration.GetAutoListItem(itemId) == null;
-    Plugin.Configuration.GetOrAddAutoListItem(itemId);
+    if (!CanListAsHq(itemId, hq))
+      return;
+
+    var name = ItemNameResolver.GetItemName(itemId);
+    var quality = hq ? "HQ" : "NQ";
+    var added = Plugin.Configuration.GetAutoListItem(itemId, hq) == null;
+    Plugin.Configuration.GetOrAddAutoListItem(itemId, hq);
     Plugin.Configuration.Save();
     _autoListAddInput = string.Empty;
 
-    if (!added)
-      Plugin.ChatGui.Print($"[HrothgarMakeCoin] {ItemNameResolver.GetItemName(itemId)} is already in the auto-list.");
+    Plugin.ChatGui.Print(added
+      ? $"[HrothgarMakeCoin] Added {name} ({quality}) to the auto-list."
+      : $"[HrothgarMakeCoin] {name} ({quality}) is already in the auto-list.");
+  }
+
+  /// <summary>
+  /// Whether <paramref name="itemId"/> may be whitelisted at the requested quality, complaining in chat
+  /// if not. An HQ entry for an item with no HQ form can never match a stack, so it would sit in the
+  /// table looking enabled and valid while every run skipped it to the log only. Both ways into the
+  /// whitelist (add-by-name and the table's HQ checkbox) go through here so neither can create that state.
+  /// </summary>
+  private static bool CanListAsHq(uint itemId, bool hq)
+  {
+    if (!hq)
+      return true;
+
+    // If the row can't be read at all, allow it: refusing on a sheet miss would block a legitimate item.
+    if (!Plugin.DataManager.GetExcelSheet<Item>().TryGetRow(itemId, out var row) || row.CanBeHq)
+      return true;
+
+    Plugin.ChatGui.PrintError(
+      $"[HrothgarMakeCoin] {ItemNameResolver.GetItemName(itemId)} has no HQ version — use NQ instead.");
+    return false;
   }
 
   private static void DrawAutoListTable()
@@ -860,10 +893,15 @@ public sealed class ConfigWindow : Window
     foreach (var entry in Plugin.Configuration.AutoListItems
       .OrderBy(e => ItemNameResolver.GetItemName(e.ItemId))
       .ThenBy(e => e.ItemId)
+      .ThenBy(e => e.ListHq) // NQ above HQ; without this the two rows of one item have no stable order.
       .ToList())
     {
       ImGui.TableNextRow();
-      ImGui.PushID((int)entry.ItemId);
+
+      // Scope by (ItemId, ListHq), not ItemId: the NQ and HQ rows of one item are separate entries, and
+      // an ImGui ID shared between two rows makes their widgets the SAME widget — editing one row's Min
+      // would drive the other's.
+      ImGui.PushID($"{entry.ItemId}#{(entry.ListHq ? 1 : 0)}");
 
       // Item name + enabled toggle + validity warning.
       ImGui.TableNextColumn();
@@ -872,6 +910,11 @@ public sealed class ConfigWindow : Window
       ImGui.SameLine();
       ImGui.AlignTextToFramePadding();
       ImGui.TextUnformatted(ItemNameResolver.GetItemName(entry.ItemId));
+      // The item's NQ and HQ rows are otherwise identical down to the name, and they sort adjacent — so
+      // say which is which here, rather than making the user read it off a checkbox two columns away and
+      // risk typing a price into the wrong one.
+      ImGui.SameLine(0f, 4f);
+      ImGui.TextColored(entry.ListHq ? UiTheme.AccentBlue : UiTheme.Muted, entry.ListHq ? "(HQ)" : "(NQ)");
       if (!entry.IsValid)
       {
         ImGui.SameLine();
@@ -879,10 +922,25 @@ public sealed class ConfigWindow : Window
         UiTheme.Tooltip("Needs a Min price (and Max >= Min) before it can be posted.");
       }
 
-      // HQ
+      // HQ. Flipping quality must not land on top of the item's other entry — that would leave two rows
+      // claiming the same (ItemId, quality), which post twice and share ImGui state. Refuse the flip.
       ImGui.TableNextColumn();
       var hq = entry.ListHq;
-      if (ImGui.Checkbox("##hq", ref hq)) { entry.ListHq = hq; Plugin.Configuration.Save(); }
+      if (ImGui.Checkbox("##hq", ref hq))
+      {
+        if (Plugin.Configuration.GetAutoListItem(entry.ItemId, hq) != null)
+        {
+          Plugin.ChatGui.PrintError(
+            $"[HrothgarMakeCoin] {ItemNameResolver.GetItemName(entry.ItemId)} already has a {(hq ? "HQ" : "NQ")} " +
+            "entry — edit or remove that one instead.");
+        }
+        else if (CanListAsHq(entry.ItemId, hq))
+        {
+          entry.ListHq = hq;
+          Plugin.Configuration.Save();
+        }
+      }
+      UiTheme.Tooltip("Post HQ stacks instead of NQ. NQ and HQ are separate entries with their own prices.");
 
       // Price mode
       ImGui.TableNextColumn();
@@ -894,29 +952,37 @@ public sealed class ConfigWindow : Window
         Plugin.Configuration.Save();
       }
 
-      // Min
+      // Min / Max.
+      //
+      // Neither bound may rewrite the other. InputInt reports a change on EVERY keystroke, so typing a
+      // ceiling of "80000" arrives as 8, 80, 800, 8000, 80000 — and a handler that pulled the floor down
+      // to meet the ceiling would latch MinPrice=8 on the first digit and never restore it, silently
+      // deleting the floor while the user's eyes were on the other column. The entry would still look
+      // valid and would post at a fraction of its worth on the next run.
+      //
+      // An inconsistent window (Max < Min) is instead left exactly as typed and reported by IsValid,
+      // which refuses to post it. Bounds skip; they never quietly move the other bound.
       ImGui.TableNextColumn();
       var min = entry.MinPrice;
       ImGui.SetNextItemWidth(-1);
       if (ImGui.InputInt("##min", ref min))
       {
-        entry.MinPrice = Math.Clamp(min, 0, int.MaxValue);
-        if (entry.MaxPrice > 0 && entry.MaxPrice < entry.MinPrice) entry.MaxPrice = entry.MinPrice;
+        entry.MinPrice = Math.Max(min, 0);
         Plugin.Configuration.Save();
       }
+      UiTheme.Tooltip("The mandatory price floor, applied last — the item is never posted below this.");
 
-      // Max
       ImGui.TableNextColumn();
       var max = entry.MaxPrice;
       ImGui.SetNextItemWidth(-1);
       if (ImGui.InputInt("##max", ref max))
       {
-        entry.MaxPrice = Math.Clamp(max, 0, int.MaxValue);
-        if (entry.MaxPrice > 0 && entry.MinPrice > entry.MaxPrice) entry.MinPrice = entry.MaxPrice;
+        entry.MaxPrice = Math.Max(max, 0);
         Plugin.Configuration.Save();
       }
       UiTheme.Tooltip("0 = no limit. If the market price is ABOVE this, the item is SKIPPED (never posted at " +
-                      "the ceiling) — otherwise a low Max would dump the item far under market value.");
+                      "the ceiling) — otherwise a low Max would dump the item far under market value.\n\n" +
+                      "A Max below Min is left as typed and simply refuses to post, rather than moving your floor.");
 
       // Quantity (0 = whole stack)
       ImGui.TableNextColumn();
