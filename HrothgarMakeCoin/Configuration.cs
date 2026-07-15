@@ -164,8 +164,15 @@ public sealed class Configuration : IPluginConfiguration
   /// <summary>Delay between auto-list steps (open -> compare -> confirm), in milliseconds.</summary>
   public int AutoListStepDelayMS { get; set; } = 300;
 
-  /// <summary>How long to wait for the market price after clicking Compare Prices, in milliseconds.</summary>
-  public int AutoListPriceWaitMS { get; set; } = 1500;
+  /// <summary>
+  /// How long to wait for the market price after clicking Compare Prices, in milliseconds.
+  ///
+  /// Sized for HQ. Listings arrive price-ascending in batches of ten across BOTH qualities, so an HQ entry
+  /// can only be priced once the batch past the NQ listings lands — measured at ~1450ms in game. This is
+  /// NOT capped by the market board's own timeout: that only bounds the FIRST batch, and each further
+  /// batch re-arms it. Too low and the answer arrives after this wait has already given up on the item.
+  /// </summary>
+  public int AutoListPriceWaitMS { get; set; } = 2000;
 
   /// <summary>The auto-list whitelist (items that may be posted to the market board).</summary>
   public List<AutoListItem> AutoListItems { get; set; } = [];
