@@ -24,6 +24,39 @@ namespace HrothgarMakeCoin
     private long _pendingNoMatchTimeoutAt;
     private long _pendingNoOfferingsTimeoutAt;
 
+    // What the caller says the NEXT request is for, and what the in-flight request turned out to be for.
+    // 0 / null means "uncorrelated": the pinch flow doesn't declare an item, and keeps the old behaviour of
+    // taking whatever answer arrives and deriving quality matching from the global "Use HQ price" toggle.
+    private uint _expectedItemId;
+    private bool? _expectedQuality;
+    private uint _inFlightItemId;
+    private bool? _matchQuality;
+
+    /// <summary>
+    /// The (item, quality) the in-flight price request was made for, or null if the request was not
+    /// correlated to one. Callers use this to prove a delivered price belongs to what they asked about.
+    /// </summary>
+    public (uint ItemId, bool Hq)? InFlightKey =>
+      _inFlightItemId != 0 && _matchQuality is bool q ? (_inFlightItemId, q) : null;
+
+    /// <summary>
+    /// Declare what the next price request is for. Two effects, both required by auto-list:
+    /// the market basis is quality-matched to <paramref name="hq"/> rather than to the pinch-oriented
+    /// "Use HQ price" preference, and a response for any other item is ignored instead of adopted.
+    /// </summary>
+    public void ExpectPriceRequest(uint itemId, bool hq)
+    {
+      _expectedItemId = itemId;
+      _expectedQuality = hq;
+    }
+
+    /// <summary>Drop back to uncorrelated pricing (the pinch flow's behaviour).</summary>
+    public void ClearExpectedPriceRequest()
+    {
+      _expectedItemId = 0;
+      _expectedQuality = null;
+    }
+
     private int NewPrice
     {
       get => _newPrice;
@@ -64,6 +97,23 @@ namespace HrothgarMakeCoin
       if (currentOfferings.RequestId == _lastRequestId)
         return;
 
+      // Reject an answer about a different item than the one we asked about.
+      //
+      // A request abandoned by the no-offerings timeout can still be answered seconds later, and by then
+      // _newRequest has been re-armed by the NEXT item — so without this check that late answer is adopted
+      // as the next item's price and posted. The timeout can't defend itself by remembering the stale
+      // RequestId, because a request that produced no offerings never told us its id; the ITEM is the only
+      // identity the response carries. (Listings arrive price-ascending for a single item, so index 0's
+      // ItemId identifies the whole response.)
+      if (_inFlightItemId != 0 && currentOfferings.ItemListings.Count > 0
+          && currentOfferings.ItemListings[0].ItemId != _inFlightItemId)
+      {
+        Svc.Log.Debug(
+          $"Ignoring market board offerings for item {currentOfferings.ItemListings[0].ItemId}; " +
+          $"the in-flight request is for {_inFlightItemId}");
+        return;
+      }
+
       ClearPendingNoOfferings();
 
       if (currentOfferings.ItemListings.Count == 0)
@@ -72,11 +122,35 @@ namespace HrothgarMakeCoin
         return;
       }
 
-      var skipNq = _useHq && _items.Single(j => j.RowId == currentOfferings.ItemListings[0].ItemId).CanBeHq;
+      // Which qualities are NOT acceptable as the basis.
+      //
+      // When the caller declared a quality (auto-list), match it exactly in BOTH directions: an HQ entry
+      // must never price off the NQ market, and an NQ entry must never price off the HQ market. Deriving
+      // this from the global "Use HQ price" toggle instead — as the uncorrelated pinch path still does —
+      // means that with the toggle off an HQ item prices against the cheapest listing of any quality,
+      // which is normally the NQ one, and posts HQ goods at NQ money.
+      //
+      // If nothing matches, the item is skipped rather than priced off the wrong quality: see the
+      // no-match handling below, which completes with -1.
+      // ItemCanBeHq stays behind the && as it always has: it hits the item sheet and throws if the row is
+      // missing, so it must not be evaluated for requests that don't care about quality.
+      bool skipNq, skipHq;
+      if (_matchQuality is bool wantHq)
+      {
+        skipNq = wantHq && ItemCanBeHq(currentOfferings.ItemListings[0].ItemId);
+        skipHq = !wantHq;
+      }
+      else
+      {
+        skipNq = _useHq && ItemCanBeHq(currentOfferings.ItemListings[0].ItemId);
+        skipHq = false;
+      }
+
       var i = 0;
       while (i < currentOfferings.ItemListings.Count)
       {
-        if (skipNq && !currentOfferings.ItemListings[i].IsHq)
+        var listing = currentOfferings.ItemListings[i];
+        if ((skipNq && !listing.IsHq) || (skipHq && listing.IsHq))
           i++;
         else
           break;
@@ -133,6 +207,13 @@ namespace HrothgarMakeCoin
     private void ItemSearchResultPostSetup(AddonEvent type, AddonArgs args)
     {
       _newRequest = true;
+
+      // Consume the caller's declaration into this request and reset it, so an expectation left behind by
+      // a compare that never opened cannot silently govern somebody else's later request.
+      _inFlightItemId = _expectedItemId;
+      _matchQuality = _expectedQuality;
+      ClearExpectedPriceRequest();
+
       _useHq = Plugin.Configuration.HQ && _itemHq;
       ClearPendingNoMatch();
       _pendingNoOfferingsTimeoutAt = Environment.TickCount64 + GetMarketBoardResultTimeoutMs();
@@ -162,6 +243,8 @@ namespace HrothgarMakeCoin
       if (changed)
         Plugin.Configuration.Save();
     }
+
+    private bool ItemCanBeHq(uint itemId) => _items.Single(j => j.RowId == itemId).CanBeHq;
 
     private static bool IsOwnRetainer(ulong retainerId) => Plugin.Configuration.SeenRetainers.Contains(retainerId);
 

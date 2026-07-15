@@ -165,7 +165,7 @@ public sealed class Configuration : IPluginConfiguration
   public int AutoListStepDelayMS { get; set; } = 300;
 
   /// <summary>How long to wait for the market price after clicking Compare Prices, in milliseconds.</summary>
-  public int AutoListPriceWaitMS { get; set; } = 1000;
+  public int AutoListPriceWaitMS { get; set; } = 1500;
 
   /// <summary>The auto-list whitelist (items that may be posted to the market board).</summary>
   public List<AutoListItem> AutoListItems { get; set; } = [];
@@ -201,14 +201,24 @@ public sealed class Configuration : IPluginConfiguration
     return limit;
   }
 
-  public AutoListItem? GetAutoListItem(uint itemId)
+  /// <summary>
+  /// An auto-list entry is identified by (ItemId, ListHq), never by ItemId alone: NQ and HQ of the same
+  /// item are two independent entries with their own prices, and they post from different stacks. Keying
+  /// on ItemId alone made the second quality silently resolve to the first one's entry, so it could never
+  /// be added ("already in the auto-list") and would have posted at the wrong quality's price.
+  /// </summary>
+  public AutoListItem? GetAutoListItem(uint itemId, bool hq)
   {
-    return AutoListItems.FirstOrDefault(x => x.ItemId == itemId);
+    return AutoListItems.FirstOrDefault(x => x.ItemId == itemId && x.ListHq == hq);
   }
 
-  public AutoListItem GetOrAddAutoListItem(uint itemId, bool hq = false)
+  /// <summary>
+  /// No default for <paramref name="hq"/> on purpose: quality is half of an entry's identity, so a caller
+  /// that omits it would silently mean NQ — which is exactly how the "HQ won't register" bug read.
+  /// </summary>
+  public AutoListItem GetOrAddAutoListItem(uint itemId, bool hq)
   {
-    var entry = GetAutoListItem(itemId);
+    var entry = GetAutoListItem(itemId, hq);
     if (entry != null)
       return entry;
 

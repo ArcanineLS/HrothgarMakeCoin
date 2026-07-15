@@ -188,10 +188,13 @@ public sealed class Plugin : IDalamudPlugin
       OnClicked = GetPriceLimitMenuItemClickedHandler(itemId),
     });
 
-    var inAutoList = Configuration.AutoListItems.Any(x => x.ItemId == itemId);
+    // Quality-aware: the HQ and NQ of one item are separate auto-list entries, so right-clicking the HQ
+    // of an already-listed NQ must still offer to ADD it rather than report it as already configured.
+    var inAutoList = Configuration.AutoListItems.Any(x => x.ItemId == itemId && x.ListHq == isHq);
+    var quality = isHq ? "HQ" : "NQ";
     args.AddMenuItem(new MenuItem
     {
-      Name = inAutoList ? "Configure HrothgarMakeCoin auto-list" : "Add to HrothgarMakeCoin auto-list",
+      Name = inAutoList ? $"Configure HrothgarMakeCoin auto-list ({quality})" : $"Add to HrothgarMakeCoin auto-list ({quality})",
       PrefixChar = 'H',
       IsEnabled = tradable,
       OnClicked = GetAutoListMenuItemClickedHandler(itemId, isHq),
@@ -228,12 +231,15 @@ public sealed class Plugin : IDalamudPlugin
     {
       try
       {
-        var added = Configuration.GetAutoListItem(itemId) == null;
+        var added = Configuration.GetAutoListItem(itemId, isHq) == null;
         Configuration.GetOrAddAutoListItem(itemId, isHq);
         Configuration.Save();
         ConfigWindow.IsOpen = true;
 
-        var message = added ? ": Added to HrothgarMakeCoin auto-list." : ": Already in HrothgarMakeCoin auto-list.";
+        var quality = isHq ? "HQ" : "NQ";
+        var message = added
+          ? $": Added to HrothgarMakeCoin auto-list ({quality})."
+          : $": Already in HrothgarMakeCoin auto-list ({quality}).";
         ChatGui.Print(new SeStringBuilder()
           .AddItemLink(itemId, isHq)
           .AddText(message)

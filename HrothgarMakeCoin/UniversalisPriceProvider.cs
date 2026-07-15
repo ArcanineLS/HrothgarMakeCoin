@@ -23,9 +23,34 @@ internal sealed class UniversalisPriceProvider : IDisposable
 
   public bool CanResolveItem(string itemName, string rawItemName) => TryGetItem(itemName, rawItemName, out _, out _);
 
-  public async Task<int> GetNewPrice(string itemName, string rawItemName, CancellationToken cancellationToken)
+  /// <summary>
+  /// Lowest data-center price for an item, already undercut.
+  ///
+  /// <paramref name="declared"/> is the exact (item, quality) the caller is posting, when it knows it
+  /// (auto-list). Both halves matter:
+  /// <list type="bullet">
+  /// <item>the item is used as-is rather than re-resolved from the dialog's name — <see cref="ResolveItemId"/>
+  /// falls back to substring matching, so a name lookup can land on a different row and price the wrong
+  /// item;</item>
+  /// <item>the quality is matched EXACTLY, in both directions, instead of letting the pinch-oriented
+  /// "Use HQ price" preference decide — with that preference off, an HQ item would otherwise price off the
+  /// cheapest listing of any quality, normally the NQ one.</item>
+  /// </list>
+  /// Null keeps the old name-resolved, preference-driven behaviour for the pinch flow.
+  /// </summary>
+  public async Task<int> GetNewPrice(string itemName, string rawItemName, (uint ItemId, bool Hq)? declared,
+    CancellationToken cancellationToken)
   {
-    if (!TryGetItem(itemName, rawItemName, out var itemId, out var hqOnly))
+    uint itemId;
+    bool preferHqOnly;
+    var requiredHq = declared?.Hq;
+
+    if (declared is { } d)
+    {
+      itemId = d.ItemId;
+      preferHqOnly = d.Hq;
+    }
+    else if (!TryGetItem(itemName, rawItemName, out itemId, out preferHqOnly))
     {
       Svc.Log.Warning($"Could not resolve item id for Universalis price check: {NormalizeItemName(itemName)}");
       return -1;
@@ -38,15 +63,21 @@ internal sealed class UniversalisPriceProvider : IDisposable
       return -1;
     }
 
+    // Only ask the server to pre-filter for HQ. There is no NQ-only query, so an NQ request fetches every
+    // quality and is filtered below.
+    var hqOnly = requiredHq ?? preferHqOnly;
+
     var marketData = await _client.GetMarketData(itemId, dataCenterName, hqOnly, cancellationToken).ConfigureAwait(false);
     if (!marketData.HasData || marketData.Listings.Count == 0)
       return -1;
 
     var listing = marketData.Listings
-      .Where(listing => listing.PricePerUnit > 0 && (!hqOnly || listing.Hq))
+      .Where(listing => listing.PricePerUnit > 0
+        && (requiredHq is bool wantHq ? listing.Hq == wantHq : (!hqOnly || listing.Hq)))
       .OrderBy(listing => listing.PricePerUnit)
       .FirstOrDefault();
 
+    // No listing of the required quality: skip, rather than fall back to the other quality's market.
     if (listing == null)
       return -1;
 
