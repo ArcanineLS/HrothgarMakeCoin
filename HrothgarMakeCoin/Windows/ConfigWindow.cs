@@ -719,7 +719,8 @@ public sealed class ConfigWindow : Window
 
     UiTheme.TextWrappedColored(UiTheme.Muted,
       "Opt-in list of items HrothgarMakeCoin may post to a retainer's market board. Only whitelisted " +
-      "items are ever posted, and each needs a Min price to be valid. (Listing execution is a work in progress.)");
+      "items are ever posted, and each needs a Min price to be valid. Run it from the Auto List button " +
+      "on the retainer's sell list, or with /hmcautolist.");
     ImGui.Dummy(new Vector2(0, 4));
 
     ConfigCheckbox("Enable auto-list",
